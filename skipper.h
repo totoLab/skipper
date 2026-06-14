@@ -33,6 +33,28 @@ struct tensor_header {
     unsigned char dimensions [4];
 };
 
+typedef struct skipper_ctx SkipperCtx;
+
+typedef struct {
+    int music_hits;
+    int talk_hits;
+    int num_windows;
+    int64_t num_samples;
+} SkipperStats;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+SkipperCtx *skipper_init (int sample_rate, int channels, int threshold, const char *tensor_filename);
+int skipper_process (SkipperCtx *ctx, const int16_t *samples, int num_samples);
+void skipper_get_stats (SkipperCtx *ctx, SkipperStats *stats);
+void skipper_free (SkipperCtx *ctx);
+
+#ifdef __cplusplus
+}
+#endif
+
 static void analysis_result_to_tensor_index (const struct analysis_result *result, int *h, int *i, int *j, int *k)
 {
     int h_index = result->range_dB >> 0;

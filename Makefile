@@ -1,19 +1,41 @@
 # Skipper Makefile
 
 CC := gcc
+CFLAGS := -O3 -fPIC
+LIBS := -lm
 
-utils := skipper tensor-gen bin2c
+ifeq ($(OS),Windows_NT)
+    EXE := .exe
+    LIB := skipper.dll
+    RM := del /Q
+    LDFLAGS := -shared
+else
+    EXE :=
+    LIB := libskipper.so
+    RM := rm -f
+    LDFLAGS := -shared
+    UNAME_S := $(shell uname -s)
+    ifeq ($(UNAME_S),Darwin)
+        LIB := libskipper.dylib
+    endif
+endif
+
+utils := skipper$(EXE) tensor-gen$(EXE) bin2c$(EXE) $(LIB)
 
 all: $(utils)
 
-skipper: skipper.c biquad.c lzwlib.c skipper.h biquad.h lzwlib.h 4d-tensor.h
-	$(CC) skipper.c biquad.c lzwlib.c -O3 -lm -o skipper
+$(LIB): skipper.c biquad.c lzwlib.c skipper.h biquad.h lzwlib.h 4d-tensor.h
+	$(CC) $(CFLAGS) $(LDFLAGS) skipper.c biquad.c lzwlib.c $(LIBS) -o $(LIB)
 
-tensor-gen: tensor-gen.c lzwlib.c skipper.h lzwlib.h
-	$(CC) tensor-gen.c lzwlib.c -lm -o tensor-gen
+skipper$(EXE): skipper.c biquad.c lzwlib.c skipper.h biquad.h lzwlib.h 4d-tensor.h
+	$(CC) $(CFLAGS) skipper.c biquad.c lzwlib.c $(LIBS) -o skipper$(EXE)
 
-bin2c: bin2c.c
-	$(CC) bin2c.c lzwlib.c -lm -o bin2c
+tensor-gen$(EXE): tensor-gen.c lzwlib.c skipper.h lzwlib.h
+	$(CC) $(CFLAGS) tensor-gen.c lzwlib.c $(LIBS) -o tensor-gen$(EXE)
+
+bin2c$(EXE): bin2c.c lzwlib.c
+	$(CC) $(CFLAGS) bin2c.c lzwlib.c $(LIBS) -o bin2c$(EXE)
 
 clean:
-	rm -f skipper tensor-gen bin2c
+	$(RM) $(utils)
+

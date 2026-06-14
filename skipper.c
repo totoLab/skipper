@@ -87,18 +87,57 @@ static const char *usage =
 
 #define MAX_CYCLES      128
 
+struct skipper_ctx {
+    int sample_rate;
+    int channels;
+    int threshold;
+    int verbose;
+    int quiet;
+
+    tensor_array tensor;
+    FILE *analysis_output_file;
+
+    // Buffers
+    float *level_buffer;
+    float *ring_buffer;
+    signed char results_buffer [AVERAGE_COUNT];
+
+    // Biquad filters
+    Biquad lowpass [2], highpass [2];
+
+    // Indices and state
+    int level_buffer_index;
+    int results_buffer_count;
+    int ring_buff_len;
+    int level_buff_len;
+    int step_samples;
+    uint32_t random;
+    double level;
+    int64_t num_samples;
+    int num_windows;
+
+    // Stats
+    int music_hits;
+    int talk_hits;
+
+    // Histograms
+    int peak_to_trough_histogram [96];
+    int cycles_histogram [256];
+    int low_third_histogram [256];
+    int mid_third_histogram [256];
+    int high_third_histogram [256];
+    int attack_ratio_histogram [256];
+    int peak_jitter_histogram [256];
+};
+
 static void fade_out (int16_t *samples, int num_samples, int stride);
 static void fade_in (int16_t *samples, int num_samples, int stride);
 
-static int read_tensor_file (tensor_array tensor, char *filename);
-static int local_tensor_file (tensor_array tensor, unsigned char *compressed_tensor, int compressed_size);
-static int analyze_window (float *levels, long sample_index, int num_samples, int sample_rate);
-static void display_histogram (const char *name, int *histogram, int count);
-static void display_analysis_results (void);
-
-static tensor_array tensor;
-static FILE *analysis_output_file;
-static int verbose, quiet;
+static int read_tensor_file (tensor_array tensor, const char *filename);
+static int local_tensor_file (tensor_array tensor, const unsigned char *compressed_tensor, int compressed_size);
+static int analyze_window (SkipperCtx *ctx, float *levels, long sample_index, int num_samples, int sample_rate);
+static void display_histogram (const char *name, const int *histogram, int count);
+static void display_analysis_results (SkipperCtx *ctx);
 
 #define MINS(s,r) ((int)((s)/((r)*60)))
 #define SECS(s,r) ((int)(((s)/(r))%60))
@@ -107,20 +146,20 @@ int main (int argc, char **argv)
 {
     int channels = CHANNELS, sample_rate = SAMPLE_RATE, keepalive = 0;
     int left_output = 0, right_output = 0, skip_mode = 0, threshold = 0;
-    int level_buffer_index = 0, output_buffer_index = 0, num_windows = 0, step_samples;
-    int level_buff_len, output_buff_len, crossfade_buff_len, ring_buff_len, results_buffer_count = 0;
+    int output_buffer_index = 0, step_samples;
+    int output_buff_len, crossfade_buff_len, results_buffer_count = 0;
     int music_hits = 0, talk_hits = 0, analysis_output_file_follows = 0, tensor_input_file_follows = 0;
     int current_mode = 0, music_up_counter = 0, talk_up_counter = 0, pend_up_counter = 0, input_samples;
-    int64_t num_samples = 0, transition_sample = 0, confirmed_sample = 0, samples_discarded = 0, samples_written = 0;
+    int verbose = 0, quiet = 0;
+    int64_t transition_sample = 0, confirmed_sample = 0, samples_discarded = 0, samples_written = 0;
     char *analysis_output_filename = NULL, *tensor_input_filename = NULL;
     int16_t *input_buffer, *output_buffer, *crossfade_buffer;
     double full_scale_rms = 32768.0 * 32767.0 * 0.5;
-    float *fsamples, *level_buffer, *ring_buffer;
+    float *fsamples;
     signed char results_buffer [AVERAGE_COUNT];
-    Biquad lowpass [2], highpass [2];
-    BiquadCoefficients coefficients;
     uint32_t random = 0x31415926;
     double level = 0.0;
+    SkipperCtx *ctx;
 
     if (argc == 1) {
         fprintf (stderr, sign_on, VERSION);
@@ -265,15 +304,20 @@ int main (int argc, char **argv)
         }
     }
 
-    if (tensor_input_filename ? !read_tensor_file (tensor, tensor_input_filename) : !local_tensor_file (tensor, tensor_4d, sizeof (tensor_4d))) {
-        fprintf (stderr, "\nerror: no tensor file, exiting!\n");
+    ctx = skipper_init (sample_rate, channels, threshold, tensor_input_filename);
+
+    if (!ctx) {
+        fprintf (stderr, "\nerror: could not initialize skipper, exiting!\n");
         return 1;
     }
 
-    if (analysis_output_filename) {
-        analysis_output_file = fopen (analysis_output_filename, "wb");
+    ctx->verbose = verbose;
+    ctx->quiet = quiet;
 
-        if (!analysis_output_file) {
+    if (analysis_output_filename) {
+        ctx->analysis_output_file = fopen (analysis_output_filename, "wb");
+
+        if (!ctx->analysis_output_file) {
             fprintf (stderr, "\nerror: can't open \"%s\" for writing!\n", analysis_output_filename);
             return 1;
         }
@@ -282,43 +326,12 @@ int main (int argc, char **argv)
     input_buffer = calloc (sample_rate, sizeof (int16_t) * channels);
     fsamples = calloc (sample_rate, sizeof (float));
 
-    step_samples = STEP_MSECS * sample_rate / 1000;
-    ring_buff_len = (sample_rate * LEVEL_WIN_MS + 500) / 1000;
-    ring_buffer = calloc (ring_buff_len, sizeof (float));
-
-    level_buff_len = WINDOW_SECONDS * sample_rate;
-    level_buffer = calloc (level_buff_len, sizeof (float));
-
+    step_samples = ctx->step_samples;
     output_buff_len = OUTPUT_SECONDS * sample_rate;
     output_buffer = calloc (output_buff_len, sizeof (int16_t) * 2);
 
     crossfade_buff_len = CROSSFADE_SECS * sample_rate;
     crossfade_buffer = calloc (crossfade_buff_len, sizeof (int16_t) * 2);
-
-#ifdef HIGHPASS_FREQ
-    biquad_highpass (&coefficients, HIGHPASS_FREQ / sample_rate);
-    biquad_init (highpass + 0, &coefficients, 1.0);
-    biquad_init (highpass + 1, &coefficients, 1.0);
-#endif
-
-#ifdef LOWPASS_FREQ
-    biquad_lowpass (&coefficients, LOWPASS_FREQ / sample_rate);
-    biquad_init (lowpass + 0, &coefficients, 1.0);
-    biquad_init (lowpass + 1, &coefficients, 1.0);
-#endif
-
-    for (int i = 0; i < ring_buff_len; ++i)
-        ring_buffer [i] = (int32_t)(random = ((random << 4) - random) ^ 1) >> 26;
-
-#ifdef HIGHPASS_FREQ
-    biquad_apply_buffer (highpass + 0, ring_buffer, ring_buff_len, 1);
-    biquad_apply_buffer (highpass + 1, ring_buffer, ring_buff_len, 1);
-#endif
-
-#ifdef LOWPASS_FREQ
-    biquad_apply_buffer (lowpass + 0, ring_buffer, ring_buff_len, 1);
-    biquad_apply_buffer (lowpass + 1, ring_buffer, ring_buff_len, 1);
-#endif
 
     while ((input_samples = fread (input_buffer, sizeof (int16_t) * channels, sample_rate, stdin))) {
 
@@ -330,31 +343,31 @@ int main (int argc, char **argv)
                 fsamples [j] = (float) input_buffer [j] + ((int32_t)(random = ((random << 4) - random) ^ 1) >> 26);
 
 #ifdef HIGHPASS_FREQ
-        biquad_apply_buffer (highpass + 0, fsamples, input_samples, 1);
-        biquad_apply_buffer (highpass + 1, fsamples, input_samples, 1);
+        biquad_apply_buffer (ctx->highpass + 0, fsamples, input_samples, 1);
+        biquad_apply_buffer (ctx->highpass + 1, fsamples, input_samples, 1);
 #endif
 
 #ifdef LOWPASS_FREQ
-        biquad_apply_buffer (lowpass + 0, fsamples, input_samples, 1);
-        biquad_apply_buffer (lowpass + 1, fsamples, input_samples, 1);
+        biquad_apply_buffer (ctx->lowpass + 0, fsamples, input_samples, 1);
+        biquad_apply_buffer (ctx->lowpass + 1, fsamples, input_samples, 1);
 #endif
 
         for (int j = 0; j < input_samples; j++) {
-            int ring_buff_index = num_samples % ring_buff_len;
+            int ring_buff_index = ctx->num_samples % ctx->ring_buff_len;
 
             if (ring_buff_index == 0) {
-                level = (ring_buffer [0] = fsamples [j]) * fsamples [j];
+                level = (ctx->ring_buffer [0] = fsamples [j]) * fsamples [j];
 
-                for (int i = 1; i < ring_buff_len; ++i)
-                    level += ring_buffer [i] * ring_buffer [i];
+                for (int i = 1; i < ctx->ring_buff_len; ++i)
+                    level += ctx->ring_buffer [i] * ctx->ring_buffer [i];
             }
             else {
-                level -= ring_buffer [ring_buff_index] * ring_buffer [ring_buff_index];
-                ring_buffer [ring_buff_index] = fsamples [j];
-                level += ring_buffer [ring_buff_index] * ring_buffer [ring_buff_index];
+                level -= ctx->ring_buffer [ring_buff_index] * ctx->ring_buffer [ring_buff_index];
+                ctx->ring_buffer [ring_buff_index] = fsamples [j];
+                level += ctx->ring_buffer [ring_buff_index] * ctx->ring_buffer [ring_buff_index];
             }
 
-            level_buffer [level_buffer_index] = level / ring_buff_len;
+            ctx->level_buffer [ctx->level_buffer_index] = level / ctx->ring_buff_len;
 
             if (left_output == OUTPUT_AUDIO)
                 output_buffer [output_buffer_index * 2] = input_buffer [j * channels];
@@ -362,8 +375,8 @@ int main (int argc, char **argv)
                 output_buffer [output_buffer_index * 2] = (input_buffer [j * channels] + input_buffer [j * channels + channels - 1]) >> 1;
             else if (left_output == OUTPUT_FILTERED)
                 output_buffer [output_buffer_index * 2] = fsamples [j];
-            else if (left_output == OUTPUT_LEVEL && output_buffer_index >= ring_buff_len / 2)
-                output_buffer [(output_buffer_index - ring_buff_len / 2) * 2] = floor ((log10 (level_buffer [level_buffer_index] / full_scale_rms) + 9.6) * 3413 + 0.5);
+            else if (left_output == OUTPUT_LEVEL && output_buffer_index >= ctx->ring_buff_len / 2)
+                output_buffer [(output_buffer_index - ctx->ring_buff_len / 2) * 2] = floor ((log10 (ctx->level_buffer [ctx->level_buffer_index] / full_scale_rms) + 9.6) * 3413 + 0.5);
 
             if (right_output == OUTPUT_AUDIO)
                 output_buffer [output_buffer_index * 2 + 1] = input_buffer [j * channels + channels - 1];
@@ -371,15 +384,15 @@ int main (int argc, char **argv)
                 output_buffer [output_buffer_index * 2 + 1] = (input_buffer [j * channels] + input_buffer [j * channels + channels - 1]) >> 1;
             else if (right_output == OUTPUT_FILTERED)
                 output_buffer [output_buffer_index * 2 + 1] = fsamples [j];
-            else if (right_output == OUTPUT_LEVEL && output_buffer_index >= ring_buff_len / 2)
-                output_buffer [(output_buffer_index - ring_buff_len / 2) * 2 + 1] = floor ((log10 (level_buffer [level_buffer_index] / full_scale_rms) + 9.6) * 3413 + 0.5);
+            else if (right_output == OUTPUT_LEVEL && output_buffer_index >= ctx->ring_buff_len / 2)
+                output_buffer [(output_buffer_index - ctx->ring_buff_len / 2) * 2 + 1] = floor ((log10 (ctx->level_buffer [ctx->level_buffer_index] / full_scale_rms) + 9.6) * 3413 + 0.5);
 
-            ++level_buffer_index;
+            ++ctx->level_buffer_index;
             ++output_buffer_index;
-            ++num_samples;
+            ++ctx->num_samples;
 
-            if (level_buffer_index == level_buff_len) {
-                int tensor_value = analyze_window (level_buffer, num_samples, level_buff_len, sample_rate), detected_mode = MODE_NOTHING;
+            if (ctx->level_buffer_index == ctx->level_buff_len) {
+                int tensor_value = analyze_window (ctx, ctx->level_buffer, ctx->num_samples, ctx->level_buff_len, sample_rate), detected_mode = MODE_NOTHING;
 
                 if (tensor_value > threshold)
                     music_hits++;
@@ -428,7 +441,7 @@ int main (int argc, char **argv)
                         }
                         else {
                             if (!music_up_counter) {
-                                transition_sample = num_samples - ((WINDOW_SECONDS + AVERAGE_SECONDS) * sample_rate) / 2;
+                                transition_sample = ctx->num_samples - ((WINDOW_SECONDS + AVERAGE_SECONDS) * sample_rate) / 2;
                                 pend_up_counter = 0;
                             }
 
@@ -454,7 +467,7 @@ int main (int argc, char **argv)
                         }
                         else {
                             if (!talk_up_counter) {
-                                transition_sample = num_samples - ((WINDOW_SECONDS + AVERAGE_SECONDS) * sample_rate) / 2;
+                                transition_sample = ctx->num_samples - ((WINDOW_SECONDS + AVERAGE_SECONDS) * sample_rate) / 2;
                                 pend_up_counter = 0;
                             }
 
@@ -469,7 +482,7 @@ int main (int argc, char **argv)
 
                     if (detected_mode) {
                         if (skip_mode == SKIP_MUSIC || skip_mode == SKIP_TALK) {
-                            int audio_offset = transition_sample - num_samples + output_buffer_index;
+                            int audio_offset = transition_sample - ctx->num_samples + output_buffer_index;
                             int crossfade_start = audio_offset - crossfade_buff_len / 2;
 
                             if (skip_mode == (detected_mode == MODE_MUSIC ? SKIP_MUSIC : SKIP_TALK)) {
@@ -523,22 +536,22 @@ int main (int argc, char **argv)
                         }
                         else if (!quiet)
                             fprintf (stderr, "%02d:%02d: detected %s starting at %02d:%02d\n",
-                                MINS (num_samples, sample_rate), SECS (num_samples, sample_rate), detected_mode == MODE_MUSIC ? "MUSIC" : " TALK",
+                                MINS (ctx->num_samples, sample_rate), SECS (ctx->num_samples, sample_rate), detected_mode == MODE_MUSIC ? "MUSIC" : " TALK",
                                 MINS (transition_sample, sample_rate), SECS (transition_sample, sample_rate));
 
                         current_mode = detected_mode;
                     }
 
                     if (!talk_up_counter && !music_up_counter)
-                        confirmed_sample = num_samples - ((WINDOW_SECONDS + AVERAGE_SECONDS) * sample_rate + step_samples + crossfade_buff_len) / 2;
+                        confirmed_sample = ctx->num_samples - ((WINDOW_SECONDS + AVERAGE_SECONDS) * sample_rate + step_samples + crossfade_buff_len) / 2;
                 }
 
-                memmove (level_buffer, level_buffer + step_samples, (WINDOW_SECONDS * sample_rate - step_samples) * sizeof (float));
-                level_buffer_index -= step_samples;
-                num_windows++;
+                memmove (ctx->level_buffer, ctx->level_buffer + step_samples, (WINDOW_SECONDS * sample_rate - step_samples) * sizeof (float));
+                ctx->level_buffer_index -= step_samples;
+                ctx->num_windows++;
             }
 
-            int available_samples = confirmed_sample - num_samples + output_buffer_index + step_samples / 2;
+            int available_samples = confirmed_sample - ctx->num_samples + output_buffer_index + step_samples / 2;
 
             if (output_buffer_index == output_buff_len || available_samples >= sample_rate * 60) {
 
@@ -618,31 +631,31 @@ int main (int argc, char **argv)
     }
 
     if (!quiet) {
-        fprintf (stderr, "total input duration = %02d:%02d\n", MINS (num_samples, sample_rate), SECS (num_samples, sample_rate));
+        fprintf (stderr, "total input duration = %02d:%02d\n", MINS (ctx->num_samples, sample_rate), SECS (ctx->num_samples, sample_rate));
 
         if (verbose)
-            fprintf (stderr, "total windows = %d\n", num_windows);
+            fprintf (stderr, "total windows = %d\n", ctx->num_windows);
 
         fprintf (stderr, "raw music hits = %d (%.1f%%), raw talk hits = %d (%.1f%%), unknowns = %d (%.1f%%)\n",
-            music_hits, music_hits * 100.0 / num_windows, talk_hits, talk_hits * 100.0 / num_windows,
-            num_windows - music_hits - talk_hits, (num_windows - music_hits - talk_hits) * 100.0 / num_windows);
+            music_hits, music_hits * 100.0 / ctx->num_windows, talk_hits, talk_hits * 100.0 / ctx->num_windows,
+            ctx->num_windows - music_hits - talk_hits, (ctx->num_windows - music_hits - talk_hits) * 100.0 / ctx->num_windows);
         fprintf (stderr, "audio written = %02d:%02d (%.1f%%), audio discarded = %02d:%02d (%.1f%%)\n\n",
             MINS (samples_written, sample_rate), SECS (samples_written, sample_rate), samples_written * 100.0 / (samples_written + samples_discarded),
             MINS (samples_discarded, sample_rate), SECS (samples_discarded, sample_rate), samples_discarded * 100.0 / (samples_written + samples_discarded));
 
-        if (analysis_output_file)
-            display_analysis_results ();
+        if (ctx->analysis_output_file)
+            display_analysis_results (ctx);
     }
 
     free (crossfade_buffer);
     free (output_buffer);
-    free (level_buffer);
-    free (ring_buffer);
     free (fsamples);
     free (input_buffer);
 
-    if (analysis_output_file)
-        fclose (analysis_output_file);
+    if (ctx->analysis_output_file)
+        fclose (ctx->analysis_output_file);
+
+    skipper_free (ctx);
 
     return 0;
 }
@@ -659,15 +672,7 @@ static void fade_in (int16_t *samples, int num_samples, int stride)
         *samples = (int64_t) *samples * (total_samples - num_samples) / total_samples;
 }
 
-static int peak_to_trough_histogram [96] = { 0 };
-static int cycles_histogram [256] = { 0 };
-static int low_third_histogram [256] = { 0 };
-static int mid_third_histogram [256] = { 0 };
-static int high_third_histogram [256] = { 0 };
-static int attack_ratio_histogram [256] = { 0 };
-static int peak_jitter_histogram [256] = { 0 };
-
-static int analyze_window (float *levels, long sample_index, int num_samples, int sample_rate)
+static int analyze_window (SkipperCtx *ctx, float *levels, long sample_index, int num_samples, int sample_rate)
 {
     double full_scale_rms = 32768.0 * 32767.0 * 0.5;
     float prev_peak = levels [0], prev_trough = levels [0];
@@ -743,8 +748,6 @@ static int analyze_window (float *levels, long sample_index, int num_samples, in
             if (attack_count != decay_count)
                 attack_ratio *= (double) (attack_count + decay_count) / (attack_count * 2.0);
         }
-        else
-            exit (1);
     }
 
     double peak_jitter = 1.0;
@@ -780,7 +783,7 @@ static int analyze_window (float *levels, long sample_index, int num_samples, in
     result.peak_jitter = (int) floor (peak_jitter * 255.0 + 0.5);
     result.cycles = cycles;
 
-    if (verbose && ((sample_index - num_samples) % (sample_rate * verbose)) == 0)
+    if (ctx->verbose && ((sample_index - num_samples) % (sample_rate * ctx->verbose)) == 0)
         fprintf (stderr, "%02d:%02d-%02d:%02d: level: %5.1f dB - %5.1f dB, peak/trough = %4.1f dB, cycles = %2d, zones = %.3f, %.3f, %.3f, attack = %.3f, jitter = %.3f\n",
             MINS (sample_index - num_samples, sample_rate), SECS (sample_index - num_samples, sample_rate),
             MINS (sample_index, sample_rate), SECS (sample_index, sample_rate),
@@ -789,38 +792,183 @@ static int analyze_window (float *levels, long sample_index, int num_samples, in
             result.low_third / 255.0, result.mid_third / 255.0, result.high_third / 255.0,
             attack_ratio, peak_jitter);
 
-    peak_to_trough_histogram [result.range_dB]++;
-    cycles_histogram [result.cycles]++;
-    low_third_histogram [result.low_third]++;
-    mid_third_histogram [result.mid_third]++;
-    high_third_histogram [result.high_third]++;
+    if (result.range_dB < 96)
+        ctx->peak_to_trough_histogram [result.range_dB]++;
+    ctx->cycles_histogram [result.cycles]++;
+    ctx->low_third_histogram [result.low_third]++;
+    ctx->mid_third_histogram [result.mid_third]++;
+    ctx->high_third_histogram [result.high_third]++;
 
     if (cycles >= 4)
-        attack_ratio_histogram [result.attack_ratio]++;
+        ctx->attack_ratio_histogram [result.attack_ratio]++;
 
     if (cycles >= 6)
-        peak_jitter_histogram [result.peak_jitter]++;
+        ctx->peak_jitter_histogram [result.peak_jitter]++;
 
-    if (analysis_output_file)
-        fwrite (&result, sizeof (result), 1, analysis_output_file);
+    if (ctx->analysis_output_file)
+        fwrite (&result, sizeof (result), 1, ctx->analysis_output_file);
 
-    return *analysis_result_to_tensor_pointer (&result, tensor);
+    return *analysis_result_to_tensor_pointer (&result, ctx->tensor);
 }
 
-static void display_analysis_results (void)
+static void display_analysis_results (SkipperCtx *ctx)
 {
-    display_histogram ("peak_to_trough", peak_to_trough_histogram, 96);
-    display_histogram ("cycles", cycles_histogram, 256);
-    display_histogram ("lower third", low_third_histogram, 256);
-    display_histogram ("middle third", mid_third_histogram, 256);
-    display_histogram ("upper third", high_third_histogram, 256);
-    display_histogram ("attack ratio", attack_ratio_histogram, 256);
-    display_histogram ("peak jitter", peak_jitter_histogram, 256);
+    display_histogram ("peak_to_trough", ctx->peak_to_trough_histogram, 96);
+    display_histogram ("cycles", ctx->cycles_histogram, 256);
+    display_histogram ("lower third", ctx->low_third_histogram, 256);
+    display_histogram ("middle third", ctx->mid_third_histogram, 256);
+    display_histogram ("upper third", ctx->high_third_histogram, 256);
+    display_histogram ("attack ratio", ctx->attack_ratio_histogram, 256);
+    display_histogram ("peak jitter", ctx->peak_jitter_histogram, 256);
 }
 
-static void display_population (int *histogram, int count, int percent);
+SkipperCtx *skipper_init (int sample_rate, int channels, int threshold, const char *tensor_filename)
+{
+    BiquadCoefficients coefficients;
+    SkipperCtx *ctx = calloc (1, sizeof (SkipperCtx));
 
-static void display_histogram (const char *name, int *histogram, int count)
+    if (!ctx)
+        return NULL;
+
+    ctx->sample_rate = sample_rate;
+    ctx->channels = channels;
+    ctx->threshold = threshold;
+    ctx->random = 0x31415926;
+
+    if (tensor_filename ? !read_tensor_file (ctx->tensor, tensor_filename) : !local_tensor_file (ctx->tensor, tensor_4d, sizeof (tensor_4d))) {
+        free (ctx);
+        return NULL;
+    }
+
+    ctx->step_samples = STEP_MSECS * sample_rate / 1000;
+    ctx->ring_buff_len = (sample_rate * LEVEL_WIN_MS + 500) / 1000;
+    ctx->ring_buffer = calloc (ctx->ring_buff_len, sizeof (float));
+
+    ctx->level_buff_len = WINDOW_SECONDS * sample_rate;
+    ctx->level_buffer = calloc (ctx->level_buff_len, sizeof (float));
+
+#ifdef HIGHPASS_FREQ
+    biquad_highpass (&coefficients, HIGHPASS_FREQ / sample_rate);
+    biquad_init (ctx->highpass + 0, &coefficients, 1.0);
+    biquad_init (ctx->highpass + 1, &coefficients, 1.0);
+#endif
+
+#ifdef LOWPASS_FREQ
+    biquad_lowpass (&coefficients, LOWPASS_FREQ / sample_rate);
+    biquad_init (ctx->lowpass + 0, &coefficients, 1.0);
+    biquad_init (ctx->lowpass + 1, &coefficients, 1.0);
+#endif
+
+    for (int i = 0; i < ctx->ring_buff_len; ++i)
+        ctx->ring_buffer [i] = (int32_t)(ctx->random = ((ctx->random << 4) - ctx->random) ^ 1) >> 26;
+
+#ifdef HIGHPASS_FREQ
+    biquad_apply_buffer (ctx->highpass + 0, ctx->ring_buffer, ctx->ring_buff_len, 1);
+    biquad_apply_buffer (ctx->highpass + 1, ctx->ring_buffer, ctx->ring_buff_len, 1);
+#endif
+
+#ifdef LOWPASS_FREQ
+    biquad_apply_buffer (ctx->lowpass + 0, ctx->ring_buffer, ctx->ring_buff_len, 1);
+    biquad_apply_buffer (ctx->lowpass + 1, ctx->ring_buffer, ctx->ring_buff_len, 1);
+#endif
+
+    return ctx;
+}
+
+int skipper_process (SkipperCtx *ctx, const int16_t *samples, int num_samples)
+{
+    float *fsamples = calloc (num_samples, sizeof (float));
+    int hits = 0;
+
+    if (!fsamples)
+        return 0;
+
+    if (ctx->channels == 2)
+        for (int j = 0; j < num_samples; j++)
+            fsamples [j] = ((float) samples [j * 2] + samples [j * 2 + 1]) / 2.0 + ((int32_t)(ctx->random = ((ctx->random << 4) - ctx->random) ^ 1) >> 26);
+    else
+        for (int j = 0; j < num_samples; j++)
+            fsamples [j] = (float) samples [j] + ((int32_t)(ctx->random = ((ctx->random << 4) - ctx->random) ^ 1) >> 26);
+
+#ifdef HIGHPASS_FREQ
+    biquad_apply_buffer (ctx->highpass + 0, fsamples, num_samples, 1);
+    biquad_apply_buffer (ctx->highpass + 1, fsamples, num_samples, 1);
+#endif
+
+#ifdef LOWPASS_FREQ
+    biquad_apply_buffer (ctx->lowpass + 0, fsamples, num_samples, 1);
+    biquad_apply_buffer (ctx->lowpass + 1, fsamples, num_samples, 1);
+#endif
+
+    for (int j = 0; j < num_samples; j++) {
+        int ring_buff_index = ctx->num_samples % ctx->ring_buff_len;
+
+        if (ring_buff_index == 0) {
+            ctx->level = (ctx->ring_buffer [0] = fsamples [j]) * fsamples [j];
+
+            for (int i = 1; i < ctx->ring_buff_len; ++i)
+                ctx->level += ctx->ring_buffer [i] * ctx->ring_buffer [i];
+        }
+        else {
+            ctx->level -= ctx->ring_buffer [ring_buff_index] * ctx->ring_buffer [ring_buff_index];
+            ctx->ring_buffer [ring_buff_index] = fsamples [j];
+            ctx->level += ctx->ring_buffer [ring_buff_index] * ctx->ring_buffer [ring_buff_index];
+        }
+
+        ctx->level_buffer [ctx->level_buffer_index] = ctx->level / ctx->ring_buff_len;
+
+        ++ctx->level_buffer_index;
+        ++ctx->num_samples;
+
+        if (ctx->level_buffer_index == ctx->level_buff_len) {
+            int tensor_value = analyze_window (ctx, ctx->level_buffer, ctx->num_samples, ctx->level_buff_len, ctx->sample_rate);
+
+            if (tensor_value > ctx->threshold) {
+                ctx->music_hits++;
+                hits++;
+            }
+            else if (tensor_value < ctx->threshold) {
+                ctx->talk_hits++;
+                hits--;
+            }
+
+            ctx->results_buffer [ctx->results_buffer_count++] = tensor_value;
+
+            if (ctx->results_buffer_count == AVERAGE_COUNT) {
+                memmove (ctx->results_buffer, ctx->results_buffer + 1, AVERAGE_COUNT - 1);
+                ctx->results_buffer_count--;
+            }
+
+            memmove (ctx->level_buffer, ctx->level_buffer + ctx->step_samples, (ctx->level_buff_len - ctx->step_samples) * sizeof (float));
+            ctx->level_buffer_index -= ctx->step_samples;
+            ctx->num_windows++;
+        }
+    }
+
+    free (fsamples);
+    return hits;
+}
+
+void skipper_get_stats (SkipperCtx *ctx, SkipperStats *stats)
+{
+    stats->music_hits = ctx->music_hits;
+    stats->talk_hits = ctx->talk_hits;
+    stats->num_windows = ctx->num_windows;
+    stats->num_samples = ctx->num_samples;
+}
+
+void skipper_free (SkipperCtx *ctx)
+{
+    if (ctx) {
+        free (ctx->level_buffer);
+        free (ctx->ring_buffer);
+        free (ctx);
+    }
+}
+
+static void display_population (const int *histogram, int count, int percent);
+
+static void display_histogram (const char *name, const int *histogram, int count)
 {
     int min_value = 1000000, max_value = -1, hits = 0, sum = 0, hits2 = 0, max_hits = 0, mode1 = 0, mode2 = 0;
     double median = 0.0;
@@ -848,17 +996,17 @@ static void display_histogram (const char *name, int *histogram, int count)
     if (hits) {
         fprintf (stderr, "%s: range = %d to %d, mean = %g, median = %g, mode = %g\n",
             name, min_value, max_value, (double) sum / hits, median, (mode1 + mode2) / 2.0);
-        display_population (histogram, count, 50);
-        display_population (histogram, count, 75);
-        display_population (histogram, count, 90);
-        display_population (histogram, count, 95);
-        display_population (histogram, count, 98);
+        display_population (histogram, (int) count, 50);
+        display_population (histogram, (int) count, 75);
+        display_population (histogram, (int) count, 90);
+        display_population (histogram, (int) count, 95);
+        display_population (histogram, (int) count, 98);
     }
 }
 
-static void display_population (int *histogram, int count, int percent)
+static void display_population (const int *histogram, int count, int percent)
 {
-    int low_value, high_value, sum = 0, sum2, target;
+    int low_value = 0, high_value = 0, sum = 0, sum2, target;
 
     for (int value = 0; value < count; ++value)
         if (histogram [value]) {
@@ -902,7 +1050,7 @@ static void display_population (int *histogram, int count, int percent)
     }
 }
 
-static int read_tensor_file (tensor_array tensor, char *filename)
+static int read_tensor_file (tensor_array tensor, const char *filename)
 {
     int num_bytes = 0, alloced_bytes = 0, res, ch;
     FILE *tensor_file = fopen (filename, "rb");
@@ -954,7 +1102,7 @@ static void write_buff (int value, void *ctx)
     stream->buffer [stream->index++] = value;
 }
 
-static int local_tensor_file (tensor_array tensor, unsigned char *compressed_tensor, int compressed_size)
+static int local_tensor_file (tensor_array tensor, const unsigned char *compressed_tensor, int compressed_size)
 {
     unsigned char dimensions [4] = { ARRAY_BINS_1, ARRAY_BINS_2, ARRAY_BINS_3, ARRAY_BINS_4 };
     struct tensor_header header;
@@ -977,7 +1125,7 @@ static int local_tensor_file (tensor_array tensor, unsigned char *compressed_ten
     memset (&reader, 0, sizeof (reader));
     memset (&writer, 0, sizeof (writer));
 
-    reader.buffer = compressed_tensor;
+    reader.buffer = (unsigned char *) compressed_tensor;
     reader.size = compressed_size;
 
     writer.buffer = (unsigned char *) tensor;
